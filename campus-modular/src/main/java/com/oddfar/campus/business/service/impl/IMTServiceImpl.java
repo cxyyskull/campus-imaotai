@@ -36,9 +36,11 @@ import java.util.Date;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.concurrent.TimeUnit;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import java.util.Random;
 
 @Service
 public class IMTServiceImpl implements IMTService {
@@ -106,8 +108,9 @@ public class IMTServiceImpl implements IMTService {
     public Boolean sendCode(String mobile, String deviceId) {
         Map<String, Object> data = new HashMap<>();
         data.put("mobile", mobile);
-        data.put("md5", signature(mobile));
-        data.put("timestamp", String.valueOf(System.currentTimeMillis()));
+        final long curTime = System.currentTimeMillis();
+        data.put("md5", signature(mobile, curTime));
+        data.put("timestamp", String.valueOf(curTime));
 //        data.put("MT-APP-Version", MT_VERSION);
 
         HttpRequest request = HttpUtil.createRequest(Method.POST,
@@ -140,9 +143,10 @@ public class IMTServiceImpl implements IMTService {
         map.put("mobile", mobile);
         map.put("vCode", code);
 
-        map.put("md5", signature(mobile + code + "" + ""));
+        final long curTime = System.currentTimeMillis();
+        map.put("md5", signature(mobile + code + "" + "", curTime));
 
-        map.put("timestamp", String.valueOf(System.currentTimeMillis()));
+        map.put("timestamp", String.valueOf(curTime));
         map.put("MT-APP-Version", getMTVersion());
 
         HttpRequest request = HttpUtil.createRequest(Method.POST,
@@ -188,6 +192,11 @@ public class IMTServiceImpl implements IMTService {
                 //预约
                 JSONObject json = reservation(iUser, itemId, shopId);
                 logContent += String.format("[预约项目]：%s\n[shopId]：%s\n[结果返回]：%s\n\n", itemId, shopId, json.toString());
+
+                //随机延迟3～5秒
+                Random random = new Random();
+                int sleepTime = random.nextInt(3) + 3;
+                Thread.sleep(sleepTime * 1000);
             } catch (Exception e) {
                 logContent += String.format("执行报错--[预约项目]：%s\n[结果返回]：%s\n\n", itemId, e.getMessage());
             }
@@ -231,6 +240,47 @@ public class IMTServiceImpl implements IMTService {
         };
         new Thread(runnable).start();
 
+    }
+    // 领取小茅运
+    public void receiveReward(IUser iUser){
+        String url = "https://h5.moutai519.com.cn/game/xmTravel/receiveReward";
+        HttpRequest request = HttpUtil.createRequest(Method.POST, url);
+
+        request.header("MT-Device-ID", iUser.getDeviceId())
+                .header("MT-APP-Version", getMTVersion())
+                .header("User-Agent", "iOS;16.3;Apple;?unrecognized?")
+                .header("MT-Lat", iUser.getLat())
+                .header("MT-Lng", iUser.getLng())
+                .cookie("MT-Token-Wap=" + iUser.getCookie() + ";MT-Device-ID-Wap=" + iUser.getDeviceId() + ";");
+
+        HttpResponse execute = request.execute();
+        JSONObject body = JSONObject.parseObject(execute.body());
+
+        if(body.getInteger("code") != 2000){
+            String message = "领取小茅运失败";
+            throw new ServiceException(message);
+        }
+    }
+
+    public void shareReward(IUser iUser){
+        logger.info("「领取每日首次分享获取耐力」："+iUser.getMobile());
+        String url = "https://h5.moutai519.com.cn/game/xmTravel/shareReward";
+        HttpRequest request = HttpUtil.createRequest(Method.POST, url);
+
+        request.header("MT-Device-ID", iUser.getDeviceId())
+                .header("MT-APP-Version", getMTVersion())
+                .header("User-Agent", "iOS;16.3;Apple;?unrecognized?")
+                .header("MT-Lat", iUser.getLat())
+                .header("MT-Lng", iUser.getLng())
+                .cookie("MT-Token-Wap=" + iUser.getCookie() + ";MT-Device-ID-Wap=" + iUser.getDeviceId() + ";");
+
+        HttpResponse execute = request.execute();
+        JSONObject body = JSONObject.parseObject(execute.body());
+
+        if(body.getInteger("code") != 2000){
+            String message = "领取每日首次分享获取耐力失败";
+            throw new ServiceException(message);
+        }
     }
 
     //获取申购耐力值
@@ -289,6 +339,10 @@ public class IMTServiceImpl implements IMTService {
         if (status == 3) {
             Integer currentPeriodCanConvertXmyNum = pageData.get("currentPeriodCanConvertXmyNum");
             Double travelRewardXmy = getXmTravelReward(iUser);
+            // 获取小茅运
+            receiveReward(iUser);
+            //首次分享获取耐力
+            shareReward(iUser);
             //本次旅行奖励领取后, 当月实际剩余旅行奖励
             if (travelRewardXmy > currentPeriodCanConvertXmyNum) {
                 String message = "当月无可领取奖励";
@@ -501,21 +555,26 @@ public class IMTServiceImpl implements IMTService {
                         .header("MT-Token", iUser.getToken())
                         .header("User-Agent", "iOS;16.3;Apple;?unrecognized?").execute().body();
                 JSONObject jsonObject = JSONObject.parseObject(body);
+                logger.info("查询申购结果回调: user->{},response->{}", iUser.getMobile(), body);
                 if (jsonObject.getInteger("code") != 2000) {
                     String message = jsonObject.getString("message");
                     throw new ServiceException(message);
                 }
-                for (Object itemVOs : jsonObject.getJSONObject("data").getJSONArray("reservationItemVOS")) {
-                    JSONObject item = JSON.parseObject(itemVOs.toString());
+                JSONArray itemVOs = jsonObject.getJSONObject("data").getJSONArray("reservationItemVOS");
+                if(Objects.isNull(itemVOs) || itemVOs.isEmpty()){
+                    logger.info("申购记录为空: user->{}", iUser.getMobile());
+                    continue;
+                }
+                for (Object itemVO : itemVOs) {
+                    JSONObject item = JSON.parseObject(itemVO.toString());
                     // 预约时间在24小时内的
                     if (item.getInteger("status") == 2 && DateUtil.between(item.getDate("reservationTime"), new Date(), DateUnit.HOUR) < 24) {
                         String logContent = DateUtil.formatDate(item.getDate("reservationTime")) + " 申购" + item.getString("itemName") + "成功";
                         IMTLogFactory.reservation(iUser, logContent);
                     }
-
                 }
             } catch (Exception e) {
-                logger.error("查询申购结果失败:失败原因{}", e.getMessage());
+                logger.error("查询申购结果失败:失败原因->{}", e.getMessage(),e);
             }
 
         }
@@ -593,9 +652,9 @@ public class IMTServiceImpl implements IMTService {
      * @param content
      * @return
      */
-    private static String signature(String content) {
+    private static String signature(String content, long time) {
 
-        String text = SALT + content + System.currentTimeMillis();
+        String text = SALT + content + time;
         String md5 = "";
         try {
             MessageDigest md = MessageDigest.getInstance("MD5");
